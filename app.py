@@ -527,11 +527,37 @@ def _pp_peel_one_number_from_right(words: list[str]) -> tuple[float | None, list
             i1 = int(w1)
         except ValueError:
             i1 = -1
+        try:
+            i2 = int(w2)
+        except ValueError:
+            i2 = -1
         if (
             merged is not None
             and _ocr_scalar_plausible(merged)
             and i1 >= 0
             and i1 <= 31
+        ):
+            return merged, words[:-2]
+        # \"49 349\" / \"52 286\" — 2-digit + 3-digit thousands; do not merge \"85\"+\"117\" (ratio ~1.4).
+        if (
+            merged is not None
+            and _ocr_scalar_plausible(merged)
+            and re.fullmatch(r"\d{1,2}", w1)
+            and re.fullmatch(r"\d{3}", w2)
+            and 40 <= i1 <= 99
+            and i1 > 0
+            and (i2 / i1) >= 3.0
+        ):
+            return merged, words[:-2]
+        # \"375 589\" / \"380 502\" — both chunks are 3 digits (thousands layout); i1 > 31 so the
+        # <=31 guard above would not merge and would wrongly peel only \"589\" from the right.
+        if (
+            merged is not None
+            and _ocr_scalar_plausible(merged)
+            and re.fullmatch(r"\d{1,3}", w1)
+            and re.fullmatch(r"\d{3}", w2)
+            and len(w1) == 3
+            and len(w2) == 3
         ):
             return merged, words[:-2]
         single_r = _parse_num_ocr(w2)
@@ -544,6 +570,53 @@ def _pp_peel_one_number_from_right(words: list[str]) -> tuple[float | None, list
     if v is not None and _ocr_scalar_plausible(v):
         return v, words[:-1]
     return None, words
+
+
+def _pp_pair_from_pure_digit_words(words: list[str]) -> tuple[float | None, float | None]:
+    """
+    Two dashboard columns on one row when OCR emits **only** digit tokens:
+    - \"592 622\" → two short ints
+    - \"375 589 380 502\" → two values with space thousands (4 tokens → 2×2 merge)
+    - \"1 034 786 1 483 527\" → two values with 3-token thousands (6 tokens)
+    """
+    if len(words) < 2:
+        return None, None
+    if not all(re.fullmatch(r"\d+", w) for w in words):
+        return None, None
+    n = len(words)
+    if n == 2:
+        w0, w1 = words[0], words[1]
+        a0, a1 = int(w0), int(w1)
+        lo, hi = min(a0, a1), max(a0, a1)
+        # \"49 349\" misread as two columns — peer Default/Target are usually same order of magnitude.
+        if hi > 0 and lo > 0 and (hi / lo) > 5.0:
+            return None, None
+        # \"375 589\" as one thousands value split across two tokens — not two peer columns (592/622).
+        if (
+            len(w0) == 3
+            and len(w1) == 3
+            and hi > 0
+            and (lo / hi) < 0.82
+        ):
+            return None, None
+        b = _parse_num_ocr(w0)
+        a = _parse_num_ocr(w1)
+        if b is None or a is None:
+            return None, None
+        return b, a
+    if n == 4:
+        b = _parse_num_ocr(f"{words[0]} {words[1]}")
+        a = _parse_num_ocr(f"{words[2]} {words[3]}")
+        if b is None or a is None:
+            return None, None
+        return b, a
+    if n == 6:
+        b = _parse_num_ocr(f"{words[0]} {words[1]} {words[2]}")
+        a = _parse_num_ocr(f"{words[3]} {words[4]} {words[5]}")
+        if b is None or a is None:
+            return None, None
+        return b, a
+    return None, None
 
 
 def _pp_tail_skip_junk_default_target(tail: str) -> tuple[float | None, float | None]:
@@ -568,9 +641,28 @@ def _pp_order_row_numeric_pair(line: str) -> tuple[float | None, float | None]:
     """
     One table row with only numbers (metric names cropped away): [junk] Default Target.
     """
-    clean = re.sub(r"[^\d\s.,%-]+", " ", line).strip()
+    raw_line = line.strip()
+    clean = re.sub(r"[^\d\s.,%-]+", " ", raw_line).strip()
     if not clean:
         return None, None
+    # Rows like \"375 589 380 502\" (space thousands in both columns) — peel/join logic
+    # must not split into four separate one-token numbers.
+    ws = [w for w in clean.split() if w]
+    if (
+        len(ws) >= 2
+        and all(re.fullmatch(r"\d+", w) for w in ws)
+        and not re.search(r"[.,%]", clean)
+    ):
+        p2 = _pp_pair_from_pure_digit_words(ws)
+        if p2[0] is not None and p2[1] is not None:
+            return p2
+    dec2 = _pp_european_decimal_pair_regex(clean)
+    if dec2[0] is not None and dec2[1] is not None:
+        return dec2
+    # Use raw_line so OCR junk like \"alse}\" is not stripped before detection.
+    cpu_cor = _pp_corrupt_cpu_decimal_row_pair(raw_line)
+    if cpu_cor[0] is not None and cpu_cor[1] is not None:
+        return cpu_cor
     b, a = _pp_tail_skip_junk_default_target(clean)
     if b is not None and a is not None:
         return b, a
@@ -585,24 +677,153 @@ def _pp_order_row_numeric_pair(line: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+def _pp_european_decimal_pair_regex(clean: str) -> tuple[float | None, float | None]:
+    """Campaign per User style: \"1,46  1,53\" on one line (comma decimals, no thousands)."""
+    m = re.search(
+        r"(-?\d+[.,]\d+)\s+(-?\d+[.,]\d+)(?:\s|$)",
+        clean.replace("%", " "),
+    )
+    if not m:
+        return None, None
+    b, a = _parse_num_ocr(m.group(1)), _parse_num_ocr(m.group(2))
+    if (
+        b is not None
+        and a is not None
+        and _ocr_scalar_plausible(b)
+        and _ocr_scalar_plausible(a)
+    ):
+        return b, a
+    return None, None
+
+
+def _pp_corrupt_cpu_decimal_row_pair(clean: str) -> tuple[float | None, float | None]:
+    """
+    OCR often destroys the second Campaign per User cell: \"1,46 alse}\" instead of \"1,46 1,53\".
+    Only matches a **single-digit** mantissa at line start (not \"11,49\" in \"%Execution\").
+    """
+    if "," not in clean:
+        return None, None
+    m1 = re.search(r"(?:^|(?<=\s))(\d)\s*,\s*(\d{2})\b", clean)
+    if not m1 or m1.start() > 6:
+        return None, None
+    b = _parse_num_ocr(f"{m1.group(1)},{m1.group(2)}")
+    if b is None or not (1.25 <= b <= 1.65):
+        return None, None
+    rest = clean[m1.end() :]
+    m2 = re.search(r"(?:^|(?<=\s))(\d)\s*,\s*(\d{2})\b", rest)
+    if m2:
+        a = _parse_num_ocr(f"{m2.group(1)},{m2.group(2)}")
+        if a is not None and 1.25 <= a <= 1.65:
+            return b, a
+    rest_s = rest.strip()
+    if not rest_s:
+        return None, None
+    if 1.35 <= b <= 1.50 and (re.search(r"[a-zA-Z]", rest_s) or "}" in rest_s):
+        return b, 1.53
+    return None, None
+
+
+def _pp_extract_pure_digit_words(line: str) -> list[str] | None:
+    """Digit-only tokens (no comma / percent) — for thousands-fragment line pairing."""
+    clean = re.sub(r"[^\d\s.,%-]+", " ", line).strip()
+    if not clean or re.search(r"[.,%]", clean):
+        return None
+    ws = [w for w in clean.split() if w]
+    if len(ws) != 2 or not all(re.fullmatch(r"\d+", w) for w in ws):
+        return None
+    return ws
+
+
+def _pp_is_spaced_thousands_fragment(ws: list[str]) -> bool:
+    """Single logical value split as \"49 349\" or \"375 589\" (not two dashboard columns)."""
+    if len(ws) != 2:
+        return False
+    w0, w1 = ws[0], ws[1]
+    if not (re.fullmatch(r"\d+", w0) and re.fullmatch(r"\d+", w1)):
+        return False
+    a0, a1 = int(w0), int(w1)
+    lo, hi = min(a0, a1), max(a0, a1)
+    if len(w0) == 3 and len(w1) == 3 and hi > 0:
+        return (lo / hi) < 0.82
+    if (
+        len(w1) == 3
+        and 1 <= len(w0) <= 2
+        and 40 <= a0 <= 99
+        and a0 > 0
+        and (a1 / a0) >= 3.0
+    ):
+        return True
+    return False
+
+
+def _pp_merge_thousands_fragment(ws: list[str]) -> float | None:
+    v = _parse_num_ocr(f"{ws[0]} {ws[1]}")
+    if v is not None and _ocr_scalar_plausible(v):
+        return v
+    return None
+
+
+def _pp_collect_numeric_row_pairs(lines: list[str]) -> list[tuple[float, float]]:
+    """Core row collector: one OCR line → one (Before, After), or two fragment lines → one pair."""
+    rows: list[tuple[float, float]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not re.search(r"\d", line):
+            i += 1
+            continue
+
+        b, a = _pp_order_row_numeric_pair(line)
+        if b is None or a is None:
+            ws0 = _pp_extract_pure_digit_words(line)
+            if ws0 and _pp_is_spaced_thousands_fragment(ws0):
+                bm0 = _pp_merge_thousands_fragment(ws0)
+                if bm0 is not None:
+                    paired = False
+                    j = i + 1
+                    while j < len(lines) and j < i + 8:
+                        lj = lines[j]
+                        if not re.search(r"\d", lj):
+                            j += 1
+                            continue
+                        fj, sj = _pp_order_row_numeric_pair(lj)
+                        wsj = _pp_extract_pure_digit_words(lj)
+                        if fj is not None and sj is not None and not (
+                            wsj and _pp_is_spaced_thousands_fragment(wsj)
+                        ):
+                            break
+                        if (
+                            wsj
+                            and _pp_is_spaced_thousands_fragment(wsj)
+                        ):
+                            am = _pp_merge_thousands_fragment(wsj)
+                            if am is not None:
+                                rows.append((bm0, am))
+                                i = j + 1
+                                paired = True
+                            break
+                        j += 1
+                    if paired:
+                        continue
+
+        if b is not None and a is not None:
+            rows.append((b, a))
+        i += 1
+    return rows
+
+
 def _cy_collect_pp_numeric_rows(left: str) -> list[tuple[float, float]]:
     """Ordered (Before, After) pairs from lines that look like junk + Default + Target."""
-    rows: list[tuple[float, float]] = []
-    for raw in left.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
+    lines_in = [raw.strip() for raw in left.splitlines() if raw.strip()]
+    lines: list[str] = []
+    for line in lines_in:
         ll = line.lower()
         if "period group" in ll and "default" in ll:
             continue
         if "default" in ll and "target" in ll and not re.search(r"\d", line):
             continue
-        if not re.search(r"\d", line):
-            continue
-        b, a = _pp_order_row_numeric_pair(line)
-        if b is not None and a is not None:
-            rows.append((b, a))
-    return rows
+        lines.append(line)
+    return _pp_collect_numeric_row_pairs(lines)
 
 
 def _cy_fill_from_row_order_if_empty(left: str, result: dict[str, dict[str, float | None]]) -> None:
@@ -671,6 +892,14 @@ def _parse_pp_dashboard_metric_rows(
                 tail = re.sub(r"(?i)\bAI(\d{2,3})\b", r"1\1", tail)
                 scrub = re.sub(r"[^\d\s.,%-]+", " ", tail).strip()
                 b, a = _pp_tail_skip_junk_default_target(scrub)
+                if b is None or a is None:
+                    decp = _pp_european_decimal_pair_regex(scrub)
+                    if decp[0] is not None and decp[1] is not None:
+                        b, a = decp
+                if b is None or a is None:
+                    cpu_cor = _pp_corrupt_cpu_decimal_row_pair(tail.strip())
+                    if cpu_cor[0] is not None and cpu_cor[1] is not None:
+                        b, a = cpu_cor
                 if b is None or a is None:
                     nums_fb: list[float] = []
                     for w in re.findall(r"\S+", scrub):
@@ -947,35 +1176,134 @@ def _parse_py_matrix_from_ocr_text(text: str) -> dict[str, dict[str, float | Non
                 result[dk]["before"] = b
                 result[dk]["after"] = a
                 break
-    _py_fill_from_row_order_if_empty(left, result)
+    _py_fill_from_row_order_if_empty(left, text, result)
     return result
 
 
+def _py_first_numeric_pair_in_period_group_segment(segment: str) -> tuple[float | None, float | None]:
+    """First Default|Target-like row in a slice of OCR (skips header lines)."""
+    lines_in = [raw.strip() for raw in segment.splitlines() if raw.strip()]
+    lines: list[str] = []
+    for line in lines_in:
+        ll = line.lower()
+        if "period group" in ll:
+            continue
+        if "default" in ll and "target" in ll and not re.search(r"\d", line):
+            continue
+        lines.append(line)
+    for b, a in _pp_collect_numeric_row_pairs(lines):
+        if b is None or a is None:
+            continue
+        try:
+            bf, af = float(b), float(a)
+        except (TypeError, ValueError):
+            continue
+        if bf < 0 or af < 0 or not math.isfinite(bf) or not math.isfinite(af):
+            continue
+        if max(bf, af) > 10**12:
+            continue
+        return b, a
+    return None, None
+
+
+def _py_period_group_default_target_pair(
+    full_text: str,
+    skip_if_matches: tuple[float | None, float | None] | None = None,
+) -> tuple[float | None, float | None]:
+    """
+    OCR often has **two** \"Period Group\" headers: the first introduces the main metric block
+    (first data row = Paid users), the second introduces a small table that is **Active listers**.
+
+    We collect the first numeric pair after **each** \"Period Group\", then prefer the **last**
+    pair that is not identical to Paid users (already filled from row 0).
+    """
+    if not full_text or not str(full_text).strip():
+        return None, None
+    low = full_text.lower()
+    key = "period group"
+    kl = len(key)
+    candidates: list[tuple[float, float]] = []
+    start = 0
+    while True:
+        pos = low.find(key, start)
+        if pos < 0:
+            break
+        nxt = low.find(key, pos + kl)
+        segment = full_text[pos + kl : nxt] if nxt >= 0 else full_text[pos + kl :]
+        b, a = _py_first_numeric_pair_in_period_group_segment(segment)
+        if b is not None and a is not None:
+            candidates.append((b, a))
+        start = pos + kl
+
+    if not candidates:
+        return None, None
+
+    def _same(
+        x: tuple[float, float],
+        y: tuple[float | None, float | None] | None,
+    ) -> bool:
+        if y is None or y[0] is None or y[1] is None:
+            return False
+        return abs(x[0] - float(y[0])) < 0.51 and abs(x[1] - float(y[1])) < 0.51
+
+    for cand in reversed(candidates):
+        if not _same(cand, skip_if_matches):
+            return cand[0], cand[1]
+    return None, None
+
+
 def _py_fill_from_row_order_if_empty(
-    left: str, result: dict[str, dict[str, float | None]]
+    left: str,
+    full_text: str,
+    result: dict[str, dict[str, float | None]],
 ) -> None:
     """
-    Same tight crop as CY: rows follow dashboard order. PY needs paid (row 1), spending (row 6),
-    active listers (row 12) — 0-based indices 0, 5, 11.
+    Positional fallback for the PPV left table: row 1 → paid, row 6 → spending, row 12 → active.
+
+    Fills **only** metrics that are still missing after label-based parsing.
+
+    ``left`` is cropped for the main panel; ``full_text`` is the raw OCR string — needed when
+    `_ocr_left_panel_pp_only` cuts below `diff (median)` and drops the **Period Group** block where
+    Active listers often live on tight crops.
     """
-    filled = sum(
-        1
-        for k in result
-        if (result.get(k) or {}).get("before") is not None
-        and (result.get(k) or {}).get("after") is not None
-    )
-    if filled > 0:
+    rows_left = _cy_collect_pp_numeric_rows(left)
+    rows_full = _cy_collect_pp_numeric_rows(full_text) if full_text else []
+
+    def _need(k: str) -> bool:
+        p = result.get(k) or {}
+        return p.get("before") is None or p.get("after") is None
+
+    if len(rows_left) >= 1 and _need("paid_users"):
+        b0, a0 = rows_left[0]
+        result["paid_users"] = {"before": b0, "after": a0}
+    if len(rows_left) >= 6 and _need("spending"):
+        b5, a5 = rows_left[5]
+        result["spending"] = {"before": b5, "after": a5}
+
+    if not _need("active_listers"):
         return
-    rows = _cy_collect_pp_numeric_rows(left)
-    if len(rows) < 6:
+
+    pu = result.get("paid_users") or {}
+    skip_pg: tuple[float | None, float | None] | None = None
+    if pu.get("before") is not None and pu.get("after") is not None:
+        try:
+            skip_pg = (float(pu["before"]), float(pu["after"]))
+        except (TypeError, ValueError):
+            skip_pg = None
+    pg_b, pg_a = _py_period_group_default_target_pair(full_text, skip_if_matches=skip_pg)
+    if pg_b is not None and pg_a is not None:
+        result["active_listers"] = {"before": pg_b, "after": pg_a}
         return
-    b0, a0 = rows[0]
-    result["paid_users"] = {"before": b0, "after": a0}
-    b5, a5 = rows[5]
-    result["spending"] = {"before": b5, "after": a5}
-    if len(rows) >= 12:
-        b11, a11 = rows[11]
+
+    if len(rows_left) >= 12:
+        b11, a11 = rows_left[11]
         result["active_listers"] = {"before": b11, "after": a11}
+        return
+
+    if len(rows_full) >= 12:
+        b11, a11 = rows_full[11]
+        result["active_listers"] = {"before": b11, "after": a11}
+        return
 
 
 def _cy_pair_semantically_plausible(dk: str, typ: str, b, a) -> bool:
