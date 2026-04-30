@@ -71,6 +71,14 @@ _CY_INPUT_METRICS = (
 )
 
 
+def _scenario_is_new_category(scenario: str) -> bool:
+    return scenario == "New category"
+
+
+def _scenario_is_py_anomaly(scenario: str) -> bool:
+    return scenario == "Previous Year anomaly"
+
+
 def _cy_sess_key(data_key: str) -> str:
     return "active" if data_key == "active_listers" else data_key
 
@@ -240,9 +248,35 @@ with st.container(border=True):
         )
         scenario = st.radio(
             "Scenario",
-            ["Regular", "Low NPL (<10)", "Other category"],
+            [
+                "Regular",
+                "Low NPL (<10)",
+                "Other category",
+                "New category",
+                "Previous Year anomaly",
+            ],
             horizontal=True,
         )
+        if _scenario_is_new_category(scenario):
+            st.date_input(
+                "Category creation date",
+                value=date.today(),
+                key="category_creation_date",
+                help=(
+                    "Used when category is less than 1 year old and Previous Year data is unavailable"
+                ),
+            )
+        elif _scenario_is_py_anomaly(scenario):
+            st.text_area(
+                "Previous Year anomaly description",
+                key="py_anomaly_description",
+                placeholder="Describe the anomaly in Previous Year data",
+                help=(
+                    "Used when Previous Year data exists but should not be used "
+                    "as a reliable Y2Y baseline"
+                ),
+                height=72,
+            )
     with set_right:
         st.date_input(
             "Release date",
@@ -281,8 +315,18 @@ with st.container(border=True):
 if scenario != "Regular":
     if scenario == "Low NPL (<10)":
         st.info("Low NPL mode is enabled: analysis will run with forced low NPL scenario.")
-    else:
+    elif scenario == "Other category":
         st.info("Other category mode is enabled: analysis will run with Other category scenario.")
+    elif _scenario_is_new_category(scenario):
+        st.info(
+            "New category mode: category is under one year old with no Previous Year baseline; "
+            "PY/Y2Y are optional and shown as unavailable in analytics."
+        )
+    elif _scenario_is_py_anomaly(scenario):
+        st.info(
+            "Previous Year anomaly mode: PY values may appear for reference, but Y2Y and "
+            "Potential Spendings that rely on PY trends are excluded."
+        )
 
 st.divider()
 
@@ -576,7 +620,9 @@ def _pp_pair_from_pure_digit_words(words: list[str]) -> tuple[float | None, floa
     """
     Two dashboard columns on one row when OCR emits **only** digit tokens:
     - \"592 622\" → two short ints
+    - \"244 390\" → two ints (same rule; no longer rejected as fake thousands split)
     - \"375 589 380 502\" → two values with space thousands (4 tokens → 2×2 merge)
+    - \"15172 26 644\" / \"12 442 21366\" → three-token OCR splits (ARP / Spending thousands)
     - \"1 034 786 1 483 527\" → two values with 3-token thousands (6 tokens)
     """
     if len(words) < 2:
@@ -591,19 +637,33 @@ def _pp_pair_from_pure_digit_words(words: list[str]) -> tuple[float | None, floa
         # \"49 349\" misread as two columns — peer Default/Target are usually same order of magnitude.
         if hi > 0 and lo > 0 and (hi / lo) > 5.0:
             return None, None
-        # \"375 589\" as one thousands value split across two tokens — not two peer columns (592/622).
-        if (
-            len(w0) == 3
-            and len(w1) == 3
-            and hi > 0
-            and (lo / hi) < 0.82
-        ):
-            return None, None
         b = _parse_num_ocr(w0)
         a = _parse_num_ocr(w1)
         if b is None or a is None:
             return None, None
         return b, a
+    if n == 3:
+        # \"15172\" \"26\" \"644\" — OCR splits the target thousands across two tokens.
+        w0, w1, w2 = words[0], words[1], words[2]
+        try:
+            i0 = int(w0)
+        except ValueError:
+            return None, None
+        if i0 >= 5000 and len(w1) <= 3 and len(w2) == 3:
+            merged_r = _parse_num_ocr(f"{w1} {w2}")
+            if merged_r is not None and _ocr_scalar_plausible(merged_r):
+                return float(w0), merged_r
+        # \"12\" \"442\" \"21366\" — first two tokens are one number, last is whole second column.
+        if len(w2) >= 5:
+            m01 = _parse_num_ocr(f"{w0} {w1}")
+            if m01 is not None and _ocr_scalar_plausible(m01):
+                try:
+                    af = float(w2)
+                except ValueError:
+                    return None, None
+                if _ocr_scalar_plausible(af):
+                    return m01, af
+        return None, None
     if n == 4:
         b = _parse_num_ocr(f"{words[0]} {words[1]}")
         a = _parse_num_ocr(f"{words[2]} {words[3]}")
@@ -744,7 +804,9 @@ def _pp_is_spaced_thousands_fragment(ws: list[str]) -> bool:
     a0, a1 = int(w0), int(w1)
     lo, hi = min(a0, a1), max(a0, a1)
     if len(w0) == 3 and len(w1) == 3 and hi > 0:
-        return (lo / hi) < 0.82
+        # Peer metrics like 244/390 also show ratio < 0.82 — require both chunks \"large\" so we only
+        # flag single thousand-numbers such as 375 589 (Active listers), not campaign-count pairs.
+        return (lo / hi) < 0.82 and lo >= 300
     if (
         len(w1) == 3
         and 1 <= len(w0) <= 2
@@ -2050,13 +2112,24 @@ def _bulk_row_priority(status: str, final_decision):
     return _by_final.get(fd, _BULK_PRIORITY_NEED_REVIEW)
 
 
-def _bulk_row_warning_flags(status: str, final_decision, has_py: bool, is_other_category: bool) -> str:
+def _bulk_row_warning_flags(
+    status: str,
+    final_decision,
+    has_py: bool,
+    is_other_category: bool,
+    is_new_category: bool,
+    is_py_anomaly: bool,
+) -> str:
     flags = []
     if final_decision == "Insufficient data":
         flags.append("LOW_PAID_USERS")
     if status == "Missing current year data":
         flags.append("MISSING_CY")
-    if not has_py:
+    if is_new_category:
+        flags.append("NEW_CATEGORY")
+    elif is_py_anomaly:
+        flags.append("PY_ANOMALY")
+    elif not has_py:
         flags.append("MISSING_PY")
     if is_other_category:
         flags.append("OTHER_CATEGORY")
@@ -2070,6 +2143,8 @@ def _bulk_analysis_dataframe(
     geo: str,
     force_low_npl: bool,
     is_other_category: bool,
+    is_new_category: bool,
+    is_py_anomaly: bool,
 ):
     """One row per category_id; CY analyze via analyze_category; PY/Y2Y control diffs."""
     rows = []
@@ -2082,7 +2157,7 @@ def _bulk_analysis_dataframe(
                     "category_id": cid,
                     "priority": _bulk_row_priority(_st, None),
                     "warning_flags": _bulk_row_warning_flags(
-                        _st, None, _has_py, is_other_category
+                        _st, None, _has_py, is_other_category, is_new_category, is_py_anomaly
                     ),
                     "status": _st,
                     "cy_paid_users_diff": None,
@@ -2114,7 +2189,11 @@ def _bulk_analysis_dataframe(
         py_paid_users_diff = None
         py_spending_diff = None
         py_cr_diff = None
-        if merged_data_previous_year and cid in merged_data_previous_year:
+        if (
+            not is_new_category
+            and merged_data_previous_year
+            and cid in merged_data_previous_year
+        ):
             pd = merged_data_previous_year[cid]
             pb = pd.get("before") or {}
             pa = pd.get("after") or {}
@@ -2153,12 +2232,20 @@ def _bulk_analysis_dataframe(
         _st_ok = ""
         _fd = result["final_decision"]
         _has_py = bool(merged_data_previous_year) and cid in merged_data_previous_year
+        if is_py_anomaly:
+            _y2y_paid_users_diff = None
+            _y2y_spending_diff = None
+            _y2y_cr_diff = None
+        else:
+            _y2y_paid_users_diff = _y2y(cy_paid_users_diff, py_paid_users_diff)
+            _y2y_spending_diff = _y2y(cy_spending_diff, py_spending_diff)
+            _y2y_cr_diff = _y2y(cy_cr, py_cr_diff)
         rows.append(
             {
                 "category_id": cid,
                 "priority": _bulk_row_priority(_st_ok, _fd),
                 "warning_flags": _bulk_row_warning_flags(
-                    _st_ok, _fd, _has_py, is_other_category
+                    _st_ok, _fd, _has_py, is_other_category, is_new_category, is_py_anomaly
                 ),
                 "status": _st_ok,
                 "cy_paid_users_diff": cy_paid_users_diff,
@@ -2170,9 +2257,9 @@ def _bulk_analysis_dataframe(
                 "py_paid_users_diff": py_paid_users_diff,
                 "py_spending_diff": py_spending_diff,
                 "py_cr_diff": py_cr_diff,
-                "y2y_paid_users_diff": _y2y(cy_paid_users_diff, py_paid_users_diff),
-                "y2y_spending_diff": _y2y(cy_spending_diff, py_spending_diff),
-                "y2y_cr_diff": _y2y(cy_cr, py_cr_diff),
+                "y2y_paid_users_diff": _y2y_paid_users_diff,
+                "y2y_spending_diff": _y2y_spending_diff,
+                "y2y_cr_diff": _y2y_cr_diff,
             }
         )
 
@@ -2223,6 +2310,13 @@ def _bulk_render_summary(df: pd.DataFrame) -> None:
         _cols = _r1 if _i < 3 else _r2
         with _cols[_i % 3]:
             st.metric(_title, int(pri_vc.get(_pkey, 0)))
+
+    py_anomaly_flag_n = int(
+        df["warning_flags"]
+        .apply(lambda w: "PY_ANOMALY" in _bulk_warning_token_set(w))
+        .sum()
+    )
+    st.metric("Previous Year anomaly (PY_ANOMALY)", py_anomaly_flag_n)
 
     with st.expander("Разбивка по priority, final_decision, status", expanded=False):
         _e1, _e2, _e3 = st.columns(3)
@@ -2310,6 +2404,16 @@ def _bulk_render_insights(df: pd.DataFrame) -> None:
         .apply(lambda w: "MISSING_PY" in _bulk_warning_token_set(w))
         .sum()
     )
+    new_category_n = int(
+        df["warning_flags"]
+        .apply(lambda w: "NEW_CATEGORY" in _bulk_warning_token_set(w))
+        .sum()
+    )
+    py_anomaly_n = int(
+        df["warning_flags"]
+        .apply(lambda w: "PY_ANOMALY" in _bulk_warning_token_set(w))
+        .sum()
+    )
     missing_cy = int((df["status"] == "Missing current year data").sum())
 
     parts = [f"Analyzed **{total}** categories."]
@@ -2319,6 +2423,12 @@ def _bulk_render_insights(df: pd.DataFrame) -> None:
         parts.append(f"📉 **{insufficient}** categories have insufficient data.")
     if missing_py:
         parts.append(f"📊 **{missing_py}** categories have no previous-year data.")
+    if new_category_n:
+        parts.append(f"📌 **{new_category_n}** categories flagged as **New category** (PY/Y2Y not used).")
+    if py_anomaly_n:
+        parts.append(
+            f"**{py_anomaly_n}** categories have Previous Year anomaly and Y2Y is excluded."
+        )
     if missing_cy:
         parts.append(f"⚠️ **{missing_cy}** categories missing current data.")
 
@@ -2349,7 +2459,12 @@ def _bulk_row_background(row: pd.Series):
     return None
 
 
-def _bulk_format_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
+def _bulk_format_table_for_display(
+    df: pd.DataFrame,
+    *,
+    new_category_mode: bool = False,
+    py_anomaly_mode: bool = False,
+) -> pd.DataFrame:
     """Тысячи с пробелом в category_id; остальные колонки без изменений."""
     if df is None or df.empty:
         return df
@@ -2364,6 +2479,31 @@ def _bulk_format_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
                 return x
 
         out["category_id"] = out["category_id"].map(_fmt_cat)
+    _dash_py_y2y = (
+        "py_paid_users_diff",
+        "py_spending_diff",
+        "py_cr_diff",
+        "y2y_paid_users_diff",
+        "y2y_spending_diff",
+        "y2y_cr_diff",
+    )
+    _dash_y2y_only = (
+        "y2y_paid_users_diff",
+        "y2y_spending_diff",
+        "y2y_cr_diff",
+    )
+
+    def _to_dash(val):
+        return "—" if val is None or (isinstance(val, float) and pd.isna(val)) else val
+
+    if new_category_mode:
+        for col in _dash_py_y2y:
+            if col in out.columns:
+                out[col] = out[col].map(_to_dash)
+    elif py_anomaly_mode:
+        for col in _dash_y2y_only:
+            if col in out.columns:
+                out[col] = out[col].map(_to_dash)
     return out
 
 
@@ -2484,7 +2624,11 @@ _merge_py_dirty = st.session_state.pop("_py_merge_dirty", False)
 if _merge_py_dirty:
     st.session_state.pop("_py_ocr_override", None)
 
-if merged_data_previous_year and _category_single_mode:
+if (
+    merged_data_previous_year
+    and _category_single_mode
+    and not _scenario_is_new_category(scenario)
+):
     category_id_py = int(_resolved_single_category_id)
     prev_cat_py = st.session_state.get("_prev_category_id_for_py_merge", "")
     sig_py = str(category_id_py)
@@ -2514,7 +2658,8 @@ if merged_data_previous_year and _category_single_mode:
             )
         st.session_state["_prev_category_id_for_py_merge"] = sig_py
     else:
-        st.warning("Category not found in Previous Year uploaded data")
+        if not _scenario_is_new_category(scenario):
+            st.warning("Category not found in Previous Year uploaded data")
         st.session_state["_prev_category_id_for_py_merge"] = sig_py
 
 if _category_bulk_mode:
@@ -2587,13 +2732,20 @@ def _build_ppv_matrix_rows(
     py_spending_a,
     py_ac_b,
     py_ac_a,
+    omit_previous_year: bool = False,
+    omit_y2y_only: bool = False,
 ):
     """Returns list of flat dicts for display (Paid users, Spending, CR, Active)."""
     cy_cr_b = _matrix_safe_div(cy_paid_users_b, cy_ac_b)
     cy_cr_a = _matrix_safe_div(cy_paid_users_a, cy_ac_a)
-    py_cr_b = _matrix_safe_div(py_paid_users_b, py_ac_b)
-    py_cr_a = _matrix_safe_div(py_paid_users_a, py_ac_a)
+    if omit_previous_year:
+        py_cr_b = None
+        py_cr_a = None
+    else:
+        py_cr_b = _matrix_safe_div(py_paid_users_b, py_ac_b)
+        py_cr_a = _matrix_safe_div(py_paid_users_a, py_ac_a)
 
+    dash = "—"
     metrics = [
         (
             "Paid users",
@@ -2620,8 +2772,23 @@ def _build_ppv_matrix_rows(
     rows_out = []
     for title, th_key, cbb, cba, pbb, pba, as_int in metrics:
         cy_d = _matrix_pct_diff(cbb, cba)
-        py_d = _matrix_pct_diff(pbb, pba)
-        y2y = (cy_d - py_d) if cy_d is not None and py_d is not None else None
+        if omit_previous_year:
+            py_d = None
+            y2y = None
+            py_before = dash
+            py_after = dash
+            py_diff_s = dash
+        else:
+            py_d = _matrix_pct_diff(pbb, pba)
+            if omit_y2y_only:
+                y2y = None
+                y2y_diff_cell = dash
+            else:
+                y2y = (cy_d - py_d) if cy_d is not None and py_d is not None else None
+                y2y_diff_cell = format_percent(y2y)
+            py_before = format_matrix_metric(pbb, as_int=as_int and pbb is not None)
+            py_after = format_matrix_metric(pba, as_int=as_int and pba is not None)
+            py_diff_s = format_percent(py_d)
         res_cy = _matrix_classify_label(cy_d, geo, th_key)
 
         rows_out.append(
@@ -2638,9 +2805,9 @@ def _build_ppv_matrix_rows(
             {
                 "Metric": title,
                 "Period": "Previous Year",
-                "Before": format_matrix_metric(pbb, as_int=as_int and pbb is not None),
-                "After": format_matrix_metric(pba, as_int=as_int and pba is not None),
-                "Diff %": format_percent(py_d),
+                "Before": py_before,
+                "After": py_after,
+                "Diff %": py_diff_s,
                 "Result": "",
             }
         )
@@ -2650,7 +2817,7 @@ def _build_ppv_matrix_rows(
                 "Period": "diff Y2Y",
                 "Before": "",
                 "After": "",
-                "Diff %": format_percent(y2y),
+                "Diff %": dash if omit_previous_year else y2y_diff_cell,
                 "Result": "",
             }
         )
@@ -2668,15 +2835,27 @@ def _compute_potential_spendings_block(
     py_paid_users_a,
     py_ac_b,
     py_ac_a,
+    omit_py: bool = False,
 ):
     cy_cr_b = _matrix_safe_div(cy_paid_users_b, cy_ac_b)
     cy_cr_a = _matrix_safe_div(cy_paid_users_a, cy_ac_a)
-    py_cr_b = _matrix_safe_div(py_paid_users_b, py_ac_b)
-    py_cr_a = _matrix_safe_div(py_paid_users_a, py_ac_a)
-    py_cr_diff_pct = _matrix_pct_diff(py_cr_b, py_cr_a)
 
     fact_arppu = _matrix_safe_div(cy_spending_a, cy_paid_users_a)
     could_be_arppu = _matrix_safe_div(cy_spending_b, cy_paid_users_b)
+    fact_spending = cy_spending_a
+
+    if omit_py:
+        return {
+            "fact_arppu": fact_arppu,
+            "could_be_arppu": could_be_arppu,
+            "fact_spending": fact_spending,
+            "could_be_spendings": None,
+            "potential_spendings_diff": None,
+        }
+
+    py_cr_b = _matrix_safe_div(py_paid_users_b, py_ac_b)
+    py_cr_a = _matrix_safe_div(py_paid_users_a, py_ac_a)
+    py_cr_diff_pct = _matrix_pct_diff(py_cr_b, py_cr_a)
 
     expected_cr_after = None
     if cy_cr_b is not None and py_cr_diff_pct is not None:
@@ -2686,7 +2865,6 @@ def _compute_potential_spendings_block(
     if cy_ac_a is not None and expected_cr_after is not None and could_be_arppu is not None:
         could_be_spendings = cy_ac_a * expected_cr_after * could_be_arppu
 
-    fact_spending = cy_spending_a
     potential_spendings_diff = None
     if fact_spending is not None and could_be_spendings is not None and could_be_spendings != 0:
         potential_spendings_diff = fact_spending / could_be_spendings - 1.0
@@ -2726,32 +2904,46 @@ def _potential_spendings_row_diff_abs(fact, could_be) -> float | None:
         return None
 
 
-def _build_potential_spendings_table_df(_pot: dict) -> pd.DataFrame:
+def _build_potential_spendings_table_df(
+    _pot: dict,
+    *,
+    omit_py_dependent_row: bool = False,
+) -> pd.DataFrame:
     """Compact table: Potential Spendings | Fact | Could be | diff | diff %."""
     fa, ca = _pot.get("fact_arppu"), _pot.get("could_be_arppu")
     fs, cs = _pot.get("fact_spending"), _pot.get("could_be_spendings")
     d1 = _potential_spendings_row_diff_pct(fa, ca)
-    d2 = _potential_spendings_row_diff_pct(fs, cs)
     a1 = _potential_spendings_row_diff_abs(fa, ca)
-    a2 = _potential_spendings_row_diff_abs(fs, cs)
-    return pd.DataFrame(
-        [
-            {
-                "Potential Spendings": "ARPpU",
-                "Fact": format_potential_amount(fa),
-                "Could be": format_potential_amount(ca),
-                "diff": format_delta(a1, as_integer=False),
-                "diff %": format_percent(d1, zero_display="0") if d1 is not None else "—",
-            },
-            {
-                "Potential Spendings": "Spendings",
-                "Fact": format_potential_amount(fs),
-                "Could be": format_potential_amount(cs),
-                "diff": format_delta(a2, as_integer=True),
-                "diff %": format_percent(d2, zero_display="0") if d2 is not None else "—",
-            },
-        ]
-    )
+    dash = "—"
+
+    row_arppu = {
+        "Potential Spendings": "ARPpU",
+        "Fact": format_potential_amount(fa),
+        "Could be": format_potential_amount(ca),
+        "diff": format_delta(a1, as_integer=False),
+        "diff %": format_percent(d1, zero_display="0") if d1 is not None else dash,
+    }
+
+    if omit_py_dependent_row:
+        row_spend = {
+            "Potential Spendings": "Spendings",
+            "Fact": format_potential_amount(fs),
+            "Could be": dash,
+            "diff": dash,
+            "diff %": dash,
+        }
+    else:
+        d2 = _potential_spendings_row_diff_pct(fs, cs)
+        a2 = _potential_spendings_row_diff_abs(fs, cs)
+        row_spend = {
+            "Potential Spendings": "Spendings",
+            "Fact": format_potential_amount(fs),
+            "Could be": format_potential_amount(cs),
+            "diff": format_delta(a2, as_integer=True),
+            "diff %": format_percent(d2, zero_display="0") if d2 is not None else dash,
+        }
+
+    return pd.DataFrame([row_arppu, row_spend])
 
 
 if _category_bulk_mode:
@@ -3061,6 +3253,10 @@ with st.container(border=True):
     st.dataframe(_sty_cy, use_container_width=True, hide_index=True)
 
 with st.expander("Previous Year (для матрицы, Y2Y и Potential Spending)", expanded=False):
+    if _scenario_is_new_category(scenario):
+        st.caption(
+            "New category: Previous Year and Y2Y are not available."
+        )
     st.caption(
         "Если загружены Previous Year файлы и найден Category ID — значения подставятся автоматически. "
         "Иначе введите вручную или используйте OCR вкладки **Previous Year**. "
@@ -3090,8 +3286,15 @@ with st.expander("Previous Year (для матрицы, Y2Y и Potential Spendin
 with st.container(border=True):
     st.subheader("PPV matrix (analytics)")
     st.caption("Только отображение; не влияет на решение по кнопке Calculate.")
+    _nc_sc = _scenario_is_new_category(scenario)
+    _py_anom_sc = _scenario_is_py_anomaly(scenario)
     mq_left, mq_right = st.columns([1.55, 1.0])
     with mq_left:
+        if _py_anom_sc:
+            st.caption(
+                "Previous Year anomaly: PY data is shown for reference, but Y2Y and "
+                "PY-dependent Potential Spendings are excluded."
+            )
         _matrix_df = pd.DataFrame(
             _build_ppv_matrix_rows(
                 geo,
@@ -3107,11 +3310,23 @@ with st.container(border=True):
                 matrix_py_spending_after,
                 matrix_py_ac_before,
                 matrix_py_ac_after,
+                omit_previous_year=_nc_sc,
+                omit_y2y_only=_py_anom_sc and not _nc_sc,
             )
         )
         st.dataframe(_matrix_df, hide_index=True, use_container_width=True)
     with mq_right:
         st.markdown("##### Potential Spendings")
+        if _nc_sc:
+            st.caption(
+                "New category: Previous Year trend is unavailable, so PY-dependent Potential "
+                "Spendings are excluded."
+            )
+        elif _py_anom_sc:
+            st.caption(
+                "Previous Year anomaly: Spendings row relies on PY CR trend — excluded here; "
+                "Could be / diff / diff % shown as —."
+            )
         _pot = _compute_potential_spendings_block(
             paid_users_before,
             paid_users_after,
@@ -3123,8 +3338,12 @@ with st.container(border=True):
             matrix_py_paid_users_after,
             matrix_py_ac_before,
             matrix_py_ac_after,
+            omit_py=_nc_sc or _py_anom_sc,
         )
-        _pot_df = _build_potential_spendings_table_df(_pot)
+        _pot_df = _build_potential_spendings_table_df(
+            _pot,
+            omit_py_dependent_row=_nc_sc or _py_anom_sc,
+        )
         st.dataframe(_pot_df, hide_index=True, use_container_width=True)
 
 st.markdown("##### Scenario")
@@ -3254,6 +3473,8 @@ if _category_bulk_mode:
                 geo,
                 _force_low,
                 _is_other,
+                _scenario_is_new_category(scenario),
+                _scenario_is_py_anomaly(scenario),
             )
             st.session_state["bulk_run_nonce"] = int(st.session_state.get("bulk_run_nonce", 0)) + 1
 
@@ -3315,7 +3536,11 @@ if _category_bulk_mode:
             f"Showing {len(_filtered_bulk)} of {len(_bulk_df)} categories"
         )
         _bulk_table_display = _bulk_styled_dataframe(
-            _bulk_format_table_for_display(_filtered_bulk)
+            _bulk_format_table_for_display(
+                _filtered_bulk,
+                new_category_mode=_scenario_is_new_category(scenario),
+                py_anomaly_mode=_scenario_is_py_anomaly(scenario),
+            )
         )
         st.dataframe(_bulk_table_display, use_container_width=True)
         _csv_bytes = _bulk_df.to_csv(index=False).encode("utf-8-sig")
